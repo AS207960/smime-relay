@@ -8,11 +8,13 @@ use notify::Watcher;
 use std::future::Future;
 use lettre::AsyncTransport;
 use mailparse::MailHeaderMap;
+use line_wrap::LineEnding;
 
 #[derive(Debug, Deserialize)]
 struct Settings {
     listen_addr: String,
     client_id: String,
+    ip_acl: Vec<cidr::IpCidr>,
     tls_conf: Option<TLSConfig>,
     onward_delivery: OnwardDeliveryConfig,
     smime_cert_dir: String,
@@ -56,7 +58,9 @@ async fn main() {
         .build();
 
     let mut mail = samotop::mail::Builder
-        + IPAcl
+        + IPAcl {
+            ip_acl: settings.ip_acl
+        }
         + Extensions
         + samotop::mail::DebugService::new(settings.client_id.clone())
         + samotop::mail::Name::new(settings.client_id.clone())
@@ -70,15 +74,16 @@ async fn main() {
 
     if let Some(tls_conf) = settings.tls_conf {
         let tls_provider = TLSProvider::new(&tls_conf.cert_file, &tls_conf.key_file).await.expect("Unable to setup TLS");
-        mail += samotop::smtp::EsmtpStartTls.with(samotop::smtp::SmtpParser, tls_provider)
+        mail += samotop::smtp::EsmtpStartTls.with(samotop::smtp::SmtpParser, tls_provider);
     }
 
-    let srv = samotop::server::TcpServer::on(settings.listen_addr).serve(mail.build());
+    let built_mail = mail.build();
+    let srv = samotop::server::TcpServer::on(settings.listen_addr).serve(built_mail);
 
     srv.await.unwrap()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TLSProvider {
     pkey: std::sync::Arc<async_std::sync::RwLock<openssl::pkey::PKey<openssl::pkey::Private>>>,
     cert_stack: std::sync::Arc<async_std::sync::RwLock<Vec<openssl::x509::X509>>>,
@@ -290,7 +295,9 @@ impl samotop::smtp::SessionService for Extensions {
 }
 
 #[derive(Debug)]
-struct IPAcl;
+struct IPAcl {
+    ip_acl: Vec<cidr::IpCidr>,
+}
 
 impl<T: samotop::mail::AcceptsSessionService> samotop::mail::MailSetup<T> for IPAcl {
     fn setup(self, config: &mut T) {
@@ -301,26 +308,18 @@ impl<T: samotop::mail::AcceptsSessionService> samotop::mail::MailSetup<T> for IP
 impl samotop::smtp::SessionService for IPAcl {
     fn prepare_session<'a, 'i, 's, 'f>(&'a self, _io: &'i mut Box<dyn samotop::io::client::tls::MayBeTls>, state: &'s mut samotop::smtp::SmtpContext) -> samotop_core::common::S1Fut<'f, ()> where 'a: 'f, 'i: 'f, 's: 'f {
         Box::pin(async move {
-            let (peer_addr, _peer_port) = match state.session.connection.peer_addr.rsplit_once(':') {
-                Some(p) => {
-                    match std::net::IpAddr::from_str(p.0) {
-                        Ok(a) => {
-                            (a, p.1.to_string())
-                        }
-                        Err(err) => {
-                            error!("Cannot parse IP: {}", err);
-                            state.session.shutdown();
-                            return;
-                        }
-                    }
+            let (peer_addr, _peer_port) = match std::net::SocketAddr::from_str(&state.session.connection.peer_addr) {
+                Ok(a) => {
+                    (a.ip(), a.port())
                 }
-                None => {
+                Err(err) => {
+                    error!("Cannot parse IP: {}", err);
                     state.session.shutdown();
                     return;
                 }
             };
 
-            if !peer_addr.is_loopback() {
+            if !self.ip_acl.iter().any(|cidr| cidr.contains(&peer_addr)) {
                 state.session.say_shutdown(samotop::smtp::SmtpReply::ServiceNotAvailableError(format!("{} is not a permitted IP;", peer_addr)));
             }
         })
@@ -445,7 +444,7 @@ impl SMIMESink {
             }
         };
 
-        let p12_file = inner.p12_dir.join(from_email_single.addr);
+        let p12_file = inner.p12_dir.join(&from_email_single.addr);
         let smime_cert = match async_std::fs::read(p12_file).await {
             Ok(c) => {
                 let p12 = match openssl::pkcs12::Pkcs12::from_der(&c) {
@@ -481,44 +480,26 @@ impl SMIMESink {
 
         signed_message.extend_from_slice(format!("Return-Path: <{}>\r\n", inner.mail_from.sender().address()).as_bytes());
 
-        let (peer_addr, _peer_port) = match inner.connection.peer_addr.rsplit_once(':') {
-            Some(p) => {
-                match std::net::IpAddr::from_str(p.0) {
-                    Ok(a) => {
-                        (a, p.1.to_string())
-                    }
-                    Err(err) => {
-                        error!("Cannot parse IP: {}", err);
-                        return Err(async_std::io::Error::new(
-                            async_std::io::ErrorKind::Other, err.to_string(),
-                        ));
-                    }
-                }
+        let (peer_addr, _peer_port) = match std::net::SocketAddr::from_str(&inner.connection.peer_addr) {
+            Ok(a) => {
+                (a.ip(), a.port())
             }
-            None => {
-                return Err(async_std::io::Error::new(
-                    async_std::io::ErrorKind::Other, "".to_string(),
-                ));
+            Err(err) => {
+                    error!("Cannot parse IP: {}", err);
+                    return Err(async_std::io::Error::new(
+                        async_std::io::ErrorKind::Other, err.to_string(),
+                    ));
             }
         };
-        let (local_addr, _local_port) = match inner.connection.local_addr.rsplit_once(':') {
-            Some(p) => {
-                match std::net::IpAddr::from_str(p.0) {
-                    Ok(a) => {
-                        (a, p.1.to_string())
-                    }
-                    Err(err) => {
-                        error!("Cannot parse IP: {}", err);
-                        return Err(async_std::io::Error::new(
-                            async_std::io::ErrorKind::Other, err.to_string(),
-                        ));
-                    }
-                }
+        let (local_addr, _local_port) = match std::net::SocketAddr::from_str(&inner.connection.local_addr) {
+            Ok(a) => {
+                (a.ip(), a.port())
             }
-            None => {
-                return Err(async_std::io::Error::new(
-                    async_std::io::ErrorKind::Other, "".to_string(),
-                ));
+            Err(err) => {
+                    error!("Cannot parse IP: {}", err);
+                    return Err(async_std::io::Error::new(
+                        async_std::io::ErrorKind::Other, err.to_string(),
+                    ));
             }
         };
 
@@ -531,10 +512,12 @@ impl SMIMESink {
             std::net::IpAddr::V6(ipv6) => format!("[IPv6:{}]", ipv6.to_string()),
         };
 
+        let hostname = gethostname::gethostname().to_string_lossy().to_string();
+
         signed_message.extend_from_slice(format!(
-            "Received: from {} ({}) by {} ({}) via {} with {} id {}; {}\r\n",
+            "Received: from {} ({}) by {} ({} {}) via {} with {} id {}; {}\r\n",
             inner.peer_name.as_ref().unwrap_or(&peer_address_literal), peer_address_literal,
-            inner.client_id, local_address_literal, "TCP", "SMTP", inner.id, chrono::Utc::now().to_rfc2822()
+            inner.client_id, hostname, local_address_literal, "TCP", "SMTP", inner.id, chrono::Utc::now().to_rfc2822()
         ).as_bytes());
 
         fn add_to_inner_msg(inner_msg: &mut Vec<u8>, parsed_mail: &mailparse::ParsedMail, first: bool) {
@@ -590,6 +573,8 @@ impl SMIMESink {
 
         match smime_cert {
             Some(p12) => {
+                info!("Signing email from {}", from_email_single);
+
                 for outer_header in email.headers.iter()
                     .filter(|h| {
                         let v = h.get_key().to_ascii_lowercase();
@@ -606,10 +591,29 @@ impl SMIMESink {
 
                 add_to_inner_msg(&mut inner_msg, &email, true);
 
+                let mut inner_msg_canon = vec![];
+                let mut last_was_r = false;
+                for b in inner_msg {
+                    if b == b'\n' && !last_was_r {
+                        inner_msg_canon.push(b'\r');
+                        inner_msg_canon.push(b);
+                        last_was_r = false;
+                    } else {
+                        if b == b'\r' {
+                            last_was_r = true;
+                        } else {
+                            last_was_r = false;
+                        }
+                        inner_msg_canon.push(b);
+                    }
+                }
+
+                let inner_msg_canon_stripped = &inner_msg_canon[..inner_msg_canon.len()-2];
+
                 let cert_stack = openssl::stack::Stack::new().unwrap();
                 let sig = match openssl::pkcs7::Pkcs7::sign(
                     &p12.cert, &p12.pkey, p12.chain.as_ref().unwrap_or_else(|| &cert_stack),
-                    &inner_msg, openssl::pkcs7::Pkcs7Flags::DETACHED,
+                    inner_msg_canon_stripped, openssl::pkcs7::Pkcs7Flags::DETACHED | openssl::pkcs7::Pkcs7Flags::BINARY,
                 ) {
                     Ok(sig) => sig,
                     Err(err) => {
@@ -620,17 +624,44 @@ impl SMIMESink {
                     }
                 };
 
-                signed_message.append(&mut match sig.to_smime(&inner_msg, openssl::pkcs7::Pkcs7Flags::DETACHED) {
-                    Ok(sig) => sig,
+                let mut signature_b64 = match sig.to_der() {
+                    Ok(sig) => base64::encode(&sig).into_bytes(),
                     Err(err) => {
                         error!("Unable to sign email: {}", err);
                         return Err(async_std::io::Error::new(
                             async_std::io::ErrorKind::Other, err.to_string(),
                         ));
                     }
-                });
+                };
+
+                let line_wrap_ending = line_wrap::crlf();
+                let orig_sig_len = signature_b64.len();
+                signature_b64.resize( orig_sig_len + (orig_sig_len / 76 * line_wrap_ending.len()), 0);
+                let line_added = line_wrap::line_wrap(
+                    &mut signature_b64, orig_sig_len, 76, &line_wrap_ending
+                );
+                let signature_b64_wrapped = &signature_b64[0..(orig_sig_len+line_added)];
+
+                let mime_boundary = format!("----={}", uuid::Uuid::new_v4());
+
+                signed_message.extend_from_slice(b"MIME-Version: 1.0\r\n");
+                signed_message.extend_from_slice(format!(
+                    "Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; micalg=sha-256; boundary=\"{}\"\r\n\r\n",
+                    mime_boundary
+                ).as_bytes());
+
+                signed_message.extend_from_slice(format!("--{}\r\n", mime_boundary).as_bytes());
+                signed_message.extend_from_slice(inner_msg_canon_stripped);
+                signed_message.extend_from_slice(format!("\r\n--{}\r\n", mime_boundary).as_bytes());
+                signed_message.extend_from_slice(b"Content-Type: application/pkcs7-signature; name=smime.p7s; smime-type=signed-data\r\n");
+                signed_message.extend_from_slice(b"Content-Transfer-Encoding: base64\r\n");
+                signed_message.extend_from_slice(b"Content-Disposition: attachment; filename=\"smime.p7s\"\r\n");
+                signed_message.extend_from_slice(b"Content-Description: S/MIME Cryptographic Signature\r\n\r\n");
+                signed_message.extend_from_slice(signature_b64_wrapped);
+                signed_message.extend_from_slice(format!("\r\n--{}--", mime_boundary).as_bytes());
             }
             None => {
+                info!("Not signing email from {}", from_email_single);
                 add_to_inner_msg(&mut signed_message, &email, false);
             }
         }

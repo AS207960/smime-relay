@@ -1,0 +1,153 @@
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: smime-certs
+spec:
+  storageClassName: standard
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: crd.projectcalico.org/v1
+kind: IPPool
+metadata:
+  name: smime-ip6-ippool
+spec:
+  blockSize: 127
+  cidr: 2a0e:1cc1:1:0:7fff:ffff:ffff:ff20/125
+  disabled: false
+  nodeSelector: !all()
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: smime-relay-conf
+data:
+  settings.toml: |
+    client_id = "smime-relay.as207960.ltd.uk"
+    listen_addr = "[::]:25"
+    ip_acl = ["2a0e:1cc1::3/128", "2001:4860:4000::/36", "2404:6800:4000::/36", "2607:f8b0:4000::/36", "2800:3f0:4000::/36", "2a00:1450:4000::/36", "2c0f:fb50:4000::/36"]
+    smime_cert_dir = "/p12/"
+
+    [tls_conf]
+    cert_file = "/tls/tls.crt"
+    key_file = "/tls/tls.key"
+
+    [onward_delivery]
+    server = "smtp-relay.gmail.com"
+    port = 25
+    use_tls = true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smime-relay
+  labels:
+    app: smime
+    part: relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smime
+      part: relay
+  template:
+    metadata:
+      annotations:
+         cni.projectcalico.org/ipv6pools: "[\"smime-ip6-ippool\"]"
+      labels:
+        app: smime
+        part: relay
+    spec:
+      volumes:
+        - name: conf
+          configMap:
+            name: smime-relay-conf
+        - name: certs
+          persistentVolumeClaim:
+            claimName: smime-certs
+        - name: tls-key
+          secret:
+            secretName: smime-relay-tls
+      containers:
+        - name: relay
+          image: as207960/smime:2
+          imagePullPolicy: Always
+          env:
+            - name: RUST_LOG
+              value: DEBUG
+            - name: SMIME_SMIME_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: smime-pass
+                  key: pass
+          volumeMounts:
+            - mountPath: "/p12"
+              name: certs
+            - mountPath: "/tls"
+              name: tls-key
+            - mountPath: "/settings.toml"
+              name: conf
+              subPath: "settings.toml"
+          ports:
+            - containerPort: 25
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: smime-relay-cert
+spec:
+  secretName: smime-relay-tls
+  duration: 2160h
+  renewBefore: 360h
+  commonName: smime-relay.as207960.ltd.uk
+  isCA: false
+  privateKey:
+    size: 4096
+    algorithm: RSA
+    encoding: PKCS1
+  usages:
+    - server auth
+  dnsNames:
+    - smime-relay.as207960.ltd.uk
+  issuerRef:
+    name: letsencrypt-as207960-ltd-uk
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: smime-relay
+spec:
+  podSelector:
+    matchLabels:
+      app: smime
+      part: relay
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 25
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smime-relay
+  labels:
+    app: smime
+    part: relay
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: smime
+    part: relay
+  ports:
+    - port: 25
+      targetPort: 25
+      protocol: TCP
+      name: smtp

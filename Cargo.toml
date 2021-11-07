@@ -19,3 +19,8 @@ config = "0"
 serde = { version = "1", features = ["derive"] }
 notify = "4"
 lettre = { version = "0.10.0-rc.4", features = ["pool", "async-std1-rustls-tls", "smtp-transport"], default_features = false }
+gethostname = "0"
+cidr = { version = "0", features = ["serde"] }
+base64 = "0"
+line-wrap = "0"
+uuid = { version = "0.8", features = ["v4"] }
