@@ -28,10 +28,17 @@ struct TLSConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct AuthConfig {
+    user: String,
+    pass: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OnwardDeliveryConfig {
     server: String,
     port: u16,
     use_tls: bool,
+    auth: Option<AuthConfig>,
 }
 
 #[async_std::main]
@@ -41,10 +48,10 @@ async fn main() {
     let mut settings = config::Config::default();
     settings
         .merge(config::File::with_name("settings").required(false)).unwrap()
-        .merge(config::Environment::with_prefix("SMIME")).unwrap();
+        .merge(config::Environment::with_prefix("SMIME").separator(".")).unwrap();
     let settings = settings.try_into::<Settings>().unwrap();
 
-    let onward_transport = lettre::transport::smtp::AsyncSmtpTransport::<lettre::AsyncStd1Executor>::builder_dangerous(
+    let mut onward_transport_builder = lettre::transport::smtp::AsyncSmtpTransport::<lettre::AsyncStd1Executor>::builder_dangerous(
         &settings.onward_delivery.server
     )
         .port(settings.onward_delivery.port)
@@ -54,8 +61,18 @@ async fn main() {
         } else {
             lettre::transport::smtp::client::Tls::Required(lettre::transport::smtp::client::TlsParameters::new(settings.onward_delivery.server).unwrap())
         })
-        .pool_config(lettre::transport::smtp::PoolConfig::new())
-        .build();
+        .pool_config(lettre::transport::smtp::PoolConfig::new());
+
+    if let Some(auth) = settings.onward_delivery.auth {
+        onward_transport_builder = onward_transport_builder.credentials(
+            lettre::transport::smtp::authentication::Credentials::new(auth.user, auth.pass)
+        ).authentication(vec![
+            lettre::transport::smtp::authentication::Mechanism::Plain,
+            lettre::transport::smtp::authentication::Mechanism::Login,
+        ]);
+    }
+
+    let onward_transport = onward_transport_builder.build();
 
     let mut mail = samotop::mail::Builder
         + IPAcl {
@@ -608,12 +625,10 @@ impl SMIMESink {
                     }
                 }
 
-                let inner_msg_canon_stripped = &inner_msg_canon[..inner_msg_canon.len()-2];
-
                 let cert_stack = openssl::stack::Stack::new().unwrap();
                 let sig = match openssl::pkcs7::Pkcs7::sign(
                     &p12.cert, &p12.pkey, p12.chain.as_ref().unwrap_or_else(|| &cert_stack),
-                    inner_msg_canon_stripped, openssl::pkcs7::Pkcs7Flags::DETACHED | openssl::pkcs7::Pkcs7Flags::BINARY,
+                    &inner_msg_canon, openssl::pkcs7::Pkcs7Flags::DETACHED | openssl::pkcs7::Pkcs7Flags::BINARY,
                 ) {
                     Ok(sig) => sig,
                     Err(err) => {
@@ -651,7 +666,7 @@ impl SMIMESink {
                 ).as_bytes());
 
                 signed_message.extend_from_slice(format!("--{}\r\n", mime_boundary).as_bytes());
-                signed_message.extend_from_slice(inner_msg_canon_stripped);
+                signed_message.extend_from_slice(&inner_msg_canon);
                 signed_message.extend_from_slice(format!("\r\n--{}\r\n", mime_boundary).as_bytes());
                 signed_message.extend_from_slice(b"Content-Type: application/pkcs7-signature; name=smime.p7s; smime-type=signed-data\r\n");
                 signed_message.extend_from_slice(b"Content-Transfer-Encoding: base64\r\n");
@@ -665,6 +680,8 @@ impl SMIMESink {
                 add_to_inner_msg(&mut signed_message, &email, false);
             }
         }
+
+        println!("{}", String::from_utf8_lossy(&signed_message));
 
         let envelope = lettre::address::Envelope::new(
             Some(inner.mail_from.sender().address().parse::<lettre::address::Address>().unwrap()),

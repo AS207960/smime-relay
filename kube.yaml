@@ -28,7 +28,7 @@ data:
   settings.toml: |
     client_id = "smime-relay.as207960.ltd.uk"
     listen_addr = "[::]:25"
-    ip_acl = ["2a0e:1cc1::3/128", "2001:4860:4000::/36", "2404:6800:4000::/36", "2607:f8b0:4000::/36", "2800:3f0:4000::/36", "2a00:1450:4000::/36", "2c0f:fb50:4000::/36"]
+    ip_acl = ["2a0e:1cc1:1:0:8000::/65", "2001:4860:4000::/36", "2404:6800:4000::/36", "2607:f8b0:4000::/36", "2800:3f0:4000::/36", "2a00:1450:4000::/36", "2c0f:fb50:4000::/36"]
     smime_cert_dir = "/p12/"
 
     [tls_conf]
@@ -36,14 +36,19 @@ data:
     key_file = "/tls/tls.key"
 
     [onward_delivery]
-    server = "smtp-relay.gmail.com"
+    server = "mx.postal.as207960.net"
     port = 25
     use_tls = true
+
+    [onward_delivery.auth]
+    user = "as207960/main"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: smime-relay
+  annotations:
+    wave.pusher.com/update-on-config-change: "true"
   labels:
     app: smime
     part: relay
@@ -73,7 +78,7 @@ spec:
             secretName: smime-relay-tls
       containers:
         - name: relay
-          image: as207960/smime:2
+          image: as207960/smime:4
           imagePullPolicy: Always
           env:
             - name: RUST_LOG
@@ -83,6 +88,10 @@ spec:
                 secretKeyRef:
                   name: smime-pass
                   key: pass
+          envFrom:
+            - prefix: "SMIME_ONWARD_DELIVERY.AUTH."
+              secretRef:
+                name: smime-smtp-auth
           volumeMounts:
             - mountPath: "/p12"
               name: certs
