@@ -45,11 +45,11 @@ struct OnwardDeliveryConfig {
 async fn main() {
     pretty_env_logger::init();
 
-    let mut settings = config::Config::default();
-    settings
-        .merge(config::File::with_name("settings").required(false)).unwrap()
-        .merge(config::Environment::with_prefix("SMIME").separator(".")).unwrap();
-    let settings = settings.try_into::<Settings>().unwrap();
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("settings").required(false))
+        .add_source(config::Environment::with_prefix("SMIME").separator("."))
+        .build().unwrap();
+    let settings = settings.try_deserialize::<Settings>().unwrap();
 
     let mut onward_transport_builder = lettre::transport::smtp::AsyncSmtpTransport::<lettre::AsyncStd1Executor>::builder_dangerous(
         &settings.onward_delivery.server
@@ -79,7 +79,7 @@ async fn main() {
             ip_acl: settings.ip_acl
         }
         + Extensions
-        + samotop::mail::DebugService::new(settings.client_id.clone())
+        + samotop::mail::DebugService {}
         + samotop::mail::Name::new(settings.client_id.clone())
         + samotop::smtp::Esmtp.with(samotop::smtp::SmtpParser)
         + SMIMESigner {
