@@ -83,13 +83,13 @@ spec:
           env:
             - name: RUST_LOG
               value: DEBUG
-            - name: SMIME_smime_pass
+            - name: smime.smime_pass
               valueFrom:
                 secretKeyRef:
                   name: smime-pass
                   key: pass
           envFrom:
-            - prefix: "SMIME_onward_delivery.auth."
+            - prefix: "smime.onward_delivery.auth."
               secretRef:
                 name: smime-smtp-auth
           volumeMounts:
