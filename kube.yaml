@@ -78,7 +78,7 @@ spec:
             secretName: smime-relay-tls
       containers:
         - name: relay
-          image: as207960/smime:5
+          image: as207960/smime:6
           imagePullPolicy: Always
           env:
             - name: RUST_LOG

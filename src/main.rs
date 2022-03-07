@@ -681,8 +681,6 @@ impl SMIMESink {
             }
         }
 
-        println!("{}", String::from_utf8_lossy(&signed_message));
-
         let envelope = lettre::address::Envelope::new(
             Some(inner.mail_from.sender().address().parse::<lettre::address::Address>().unwrap()),
             inner.recipients.into_iter().map(|r| r.address.address().parse::<lettre::address::Address>().unwrap()).collect(),
