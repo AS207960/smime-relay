@@ -677,7 +677,19 @@ impl SMIMESink {
             }
             None => {
                 info!("Not signing email from {}", from_email_single);
-                add_to_inner_msg(&mut signed_message, &email, false);
+
+                for outer_header in email.headers.iter()
+                    .filter(|h| {
+                        let v = h.get_key().to_ascii_lowercase();
+                        v != "content-type" && v != "content-transfer-encoding" && v != "dkim-signature"
+                    }) {
+                    signed_message.extend_from_slice(outer_header.get_key_raw());
+                    signed_message.extend_from_slice(b": ");
+                    signed_message.extend_from_slice(outer_header.get_value_raw());
+                    signed_message.extend_from_slice(b"\r\n");
+                }
+
+                add_to_inner_msg(&mut signed_message, &email, true);
             }
         }
 
